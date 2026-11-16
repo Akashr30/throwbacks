@@ -47,7 +47,12 @@ optional: with it, the AI day summaries and the usage meter need no key.
    ```
    It opens <http://127.0.0.1:8770/> and reads the AI apps it finds on
    your Mac — read-only — then shows Today.
-2. For AI day summaries, log in to Claude Code once:
+2. For AI day summaries, Claude Code's command line needs to be logged in
+   (the Claude desktop app's login doesn't count). Check:
+   ```bash
+   claude auth status
+   ```
+   If it doesn't say `"loggedIn": true`, log in once:
    ```bash
    claude auth login
    ```
