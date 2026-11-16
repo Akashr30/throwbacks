@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Throwbacks layout checks</title>
+  <style>
+    :root { color-scheme: light; }
+    body { margin: 24px; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; color: #111; background: #fafafa; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    p { margin: 0 0 12px; color: #444; max-width: 70ch; }
+    #summary { font-weight: 600; font-size: 16px; margin: 12px 0; }
+    table { border-collapse: collapse; margin-bottom: 16px; }
+    td { padding: 3px 14px 3px 0; vertical-align: top; }
+    .pass { color: #006300; font-weight: 600; }
+    .fail { color: #8e2626; font-weight: 600; }
+    .detail { color: #666; }
+    iframe { display: block; border: 1px solid #ccc; background: #fff; }
+  </style>
+</head>
+<body>
+  <h1>Throwbacks layout checks</h1>
+  <p>Loads the app in the frame below — the front page, then the journal on its sample
+    data (<code>/?sample</code>, which never reads your apps) — and measures it at every
+    width from a wide desktop to a phone, at each text size and font: nothing spills sideways,
+    the top bar fits, the conversation sits beside the page (or over it, or full screen),
+    menus stay on screen and the phone's tab bar never covers the end of a page. It changes
+    appearance inside the frame only and puts back anything it touches.
+    Open it from the running server, e.g. http://127.0.0.1:8770/tests/layout.html</p>
+  <div id="summary">Running…</div>
+  <table id="results"></table>
+  <iframe id="app" title="Throwbacks under test" width="1280" height="800"></iframe>
+
+  <script type="module">
+    const frame = document.getElementById('app');
+    const table = document.getElementById('results');
+    const summary = document.getElementById('summary');
+    const results = [];
+    window.layoutResults = results; // for automation
+
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    async function until(fn, ms = 10000) {
+      const start = performance.now();
+      while (performance.now() - start < ms) {
+        const value = fn();
+        if (value) return value;
+        await sleep(50);
+      }
+      return null;
+    }
+    function report(passed, name, detail = '') {
+      results.push({ passed, name, detail });
+      const row = table.insertRow();
+      const mark = row.insertCell();
+      mark.textContent = passed ? 'PASS' : 'FAIL';
+      mark.className = passed ? 'pass' : 'fail';
+      row.insertCell().textContent = name;
+      const d = row.insertCell();
+      d.textContent = detail;
+      d.className = 'detail';
+    }
+
+    // What this page touches in the app's storage, put back at the end.
+    const KEYS = ['throwbacks-view', 'throwbacks-appearance'];
+    const saved = Object.fromEntries(KEYS.map((k) => [k, localStorage.getItem(k)]));
+    const restore = () => KEYS.forEach((k) => (saved[k] === null ? localStorage.removeItem(k) : localStorage.setItem(k, saved[k])));
+
+    /** Load the app at a frame size; resolves with its window + document. */
+    async function load(width, height, path) {
+      frame.width = width;
+      frame.height = height;
+      const loaded = new Promise((r) => frame.addEventListener('load', r, { once: true }));
+      frame.src = path;
+      await loaded;
+      const d = frame.contentDocument;
+      await d.fonts.ready;
+      return { w: frame.contentWindow, d };
+    }
+    const settle = () => sleep(160);
+    async function journal(width, height = 800, hash = '#/today') {
+      const { w, d } = await load(width, height, `/?sample&layout-check=${Date.now()}${hash}`);
+      await until(() => d.querySelector('#page-scroll .page'));
+      await settle();
+      return { w, d };
+    }
+    // Sideways scrolling: the document's, and the page's, the reader's and its body's own (they scroll by themselves).
+    const overflowX = (w, d) => Math.max(d.documentElement.scrollWidth - w.innerWidth, ...['#page-scroll', '#reader', '#reader .reader-body'].map((sel) => {
+      const el = d.querySelector(sel);
+      return el && !el.hidden ? el.scrollWidth - el.clientWidth : 0;
+    }));
+    /**
+     * Sessions → Folder, opened: a row's buttons (shown over its ≈time and date on hover) never sit on
+     * its name or title, no row runs past the card, and — when the tree is wide — every row's times end
+     * in one column.
+     */
+    function sessionRows(w, d) {
+      const bad = [];
+      const tree = d.querySelector('.tree');
+      const card = tree.getBoundingClientRect();
+      for (const row of tree.querySelectorAll('.trow')) {
+        const name = row.querySelector('.trow-name').textContent;
+        if (row.getBoundingClientRect().right > card.right + 1) bad.push(`${name}: past the card`);
+        const end = row.querySelector(':scope > .trow-end');
+        const e = end && end.getBoundingClientRect();
+        if (!e || !e.width) continue;
+        const words = [...row.querySelectorAll('.trow-name, .count, .going-dot, .trow-hint, .trow-title')].map((x) => x.getBoundingClientRect())
+          .filter((r) => r.width && r.top < e.bottom && r.bottom > e.top);
+        if (words.some((r) => r.right > e.left + 1)) bad.push(`${name}: its buttons over its name`);
+      }
+      for (const wrap of tree.querySelectorAll('.srow-wrap')) {
+        const acts = wrap.querySelector(':scope > .srow-acts');
+        if (w.getComputedStyle(acts).display === 'none') continue;
+        if (wrap.querySelector('.srow-main').getBoundingClientRect().right > acts.getBoundingClientRect().left + 1) bad.push(`${wrap.querySelector('.srow-title').textContent}: its buttons over its title`);
+      }
+      if (card.width > 34 * 16 + 40) {
+        const ends = [...tree.querySelectorAll('.trow-meta, .srow-side, .fold-go')]
+          .map((x) => Math.round(x.getBoundingClientRect().right)).filter(Boolean);
+        if (new Set(ends).size > 1) bad.push(`times end at ${[...new Set(ends)].join(' / ')}`);
+      }
+      return bad;
+    }
+    /** Everything in the top bar's first row ends inside the bar. */
+    function topbarSpill(w, d) {
+      const bar = d.getElementById('topbar');
+      const css = w.getComputedStyle(bar);
+      const right = bar.getBoundingClientRect().right - parseFloat(css.paddingRight) + 1;
+      let worst = 0;
+      for (const el of bar.querySelectorAll('.topbar-row > *, .weekstrip, .topbar-actions > *')) {
+        const r = el.getBoundingClientRect();
+        if (r.width) worst = Math.max(worst, Math.round(r.right - right));
+      }
+      return worst;
+    }
+
+    const WIDTHS = [1600, 1440, 1280, 1180, 1100, 1024, 900, 800, 761, 760, 600, 430, 375, 340];
+    const TEXT = ['default', 'large', 'larger'];
+    const FONTS = [null, 'system'];
+
+    try {
+      // 1. The front page (opening straight into your chats switched off).
+      localStorage.setItem('throwbacks-view', JSON.stringify({ v: 2, auto: false }));
+      {
+        const { d } = await load(1100, 800, `/?layout-check=${Date.now()}`);
+        await until(() => d.querySelectorAll('.app-tile').length && !d.querySelector('.app-detail')?.textContent.includes('Checking'), 6000);
+        report(d.querySelectorAll('.app-tile').length === 6, 'front page: six app tiles', `${d.querySelectorAll('.app-tile').length} tiles`);
+        report(!d.querySelector('[data-set-design], #css-classic'), 'front page: no design switch, one stylesheet');
+      }
+      restore();
+
+      // 2. The journal at every width, text size and font: nothing spills.
+      {
+        const { w, d } = await journal(1280);
+        const root = d.documentElement;
+        const spills = [];
+        const tops = [];
+        for (const text of TEXT) {
+          for (const font of FONTS) {
+            if (text === 'default') delete root.dataset.text; else root.dataset.text = text;
+            if (font) root.dataset.gfont = font; else delete root.dataset.gfont;
+            for (const width of WIDTHS) {
+              frame.width = width;
+              await settle();
+              const o = overflowX(w, d);
+              if (o > 1) spills.push(`${width}px ${text} ${font || 'Onest'} (+${o})`);
+              const t = topbarSpill(w, d);
+              if (t > 0) tops.push(`${width}px ${text} ${font || 'Onest'} (+${t})`);
+            }
+          }
+        }
+        delete root.dataset.text;
+        delete root.dataset.gfont;
+        report(!spills.length, 'Today: no sideways scroll at any width, text size or font', spills.slice(0, 6).join(', '));
+        report(!tops.length, 'Today: the top bar\'s row fits at every width, text size and font', tops.slice(0, 6).join(', '));
+      }
+
+      // 3. The conversation: beside the page, over it, or full screen.
+      {
+        const { w, d } = await journal(1440);
+        d.querySelector('.scard').click();
+        await settle();
+        const main = d.querySelector('.main').getBoundingClientRect();
+        let reader = d.getElementById('reader').getBoundingClientRect();
+        report(!d.getElementById('reader').hidden && main.right <= reader.left + 1, 'wide: the conversation sits beside the page',
+          `main ends ${Math.round(main.right)}, reader starts ${Math.round(reader.left)}`);
+        const tops = [];
+        for (const text of TEXT) {
+          if (text === 'default') delete d.documentElement.dataset.text; else d.documentElement.dataset.text = text;
+          for (const width of [1600, 1440, 1280, 1181]) {
+            frame.width = width;
+            await settle();
+            const t = topbarSpill(w, d);
+            if (t > 0) tops.push(`${width}px ${text} (+${t})`);
+          }
+        }
+        delete d.documentElement.dataset.text;
+        report(!tops.length, 'with a conversation open, the top bar still fits', tops.join(', '));
+        // offset* measure the layout box: an entrance animation's transform
+        // (frozen while this pane isn't on screen) doesn't count.
+        const box = (el) => ({ left: el.offsetLeft, right: el.offsetLeft + el.offsetWidth, width: el.offsetWidth });
+        frame.width = 1100;
+        await settle();
+        reader = box(d.getElementById('reader'));
+        report(w.getComputedStyle(d.getElementById('reader')).position === 'fixed' && reader.right <= w.innerWidth + 1 && reader.left > 0,
+          'laptop: the conversation floats over the page, on screen', `${reader.left}–${reader.right} of ${w.innerWidth}`);
+        frame.width = 375;
+        await settle();
+        reader = box(d.getElementById('reader'));
+        report(reader.left === 0 && reader.width === w.innerWidth && w.getComputedStyle(d.getElementById('tabbar')).display === 'none',
+          'phone: the conversation fills the screen, tabs hidden', `${reader.width}px wide`);
+        const body = d.querySelector('.reader-body');
+        report(body.scrollWidth <= body.clientWidth + 1, 'phone: long code scrolls inside its block, not the conversation', `${body.scrollWidth} vs ${body.clientWidth}`);
+        // The header: the title on top, each detail whole on one line (a long name shortens, never breaks),
+        // the buttons on a row of their own — at a phone's, a laptop's and a wide screen's width.
+        const headBad = [];
+        for (const width of [375, 1100, 1600]) {
+          frame.width = width;
+          await settle();
+          const head = d.querySelector('.reader-head');
+          const title = d.querySelector('.reader-title').getBoundingClientRect();
+          const acts = d.querySelector('.reader-actions');
+          if (head.scrollWidth > head.clientWidth + 1) headBad.push(`${width}px: wider than the header`);
+          if ([...d.querySelectorAll('.reader-meta > *:not(.sep)')].some((x) => x.offsetHeight > 30)) headBad.push(`${width}px: a detail breaks across lines`);
+          if (acts && acts.getBoundingClientRect().top < title.bottom - 1) headBad.push(`${width}px: buttons beside the title`);
+        }
+        report(!headBad.length, 'the conversation\'s header: title, a line of details, then its buttons', headBad.join(', '));
+        frame.width = 375;
+        await settle();
+        d.querySelector('.reader-close').click();
+        await settle();
+        report(d.getElementById('reader').hidden, 'closing the conversation hides it');
+        // A commit's message opens its chat at that commit: a marker there, in view.
+        frame.width = 1440;
+        const y = new Date(); y.setDate(y.getDate() - 1);
+        w.location.hash = `#/day/${y.getFullYear()}-${String(y.getMonth() + 1).padStart(2, '0')}-${String(y.getDate()).padStart(2, '0')}`;
+        await settle();
+        const link = d.querySelector('.crow-main.is-link');
+        if (link) link.click();
+        await settle();
+        await settle();
+        const mark = d.querySelector('.msg-commit');
+        const inView = mark && (() => { const b = d.querySelector('.reader-body').getBoundingClientRect(), r = mark.getBoundingClientRect(); return r.top >= b.top && r.bottom <= b.bottom; })();
+        report(!!link && !!mark && inView, 'a commit opens its chat at that commit, marked and in view', link ? (mark ? 'not in view' : 'no marker') : 'no linked commit');
+        d.querySelector('.reader-close').click();
+        await settle();
+      }
+
+      // 4. Phone: the rail gives way to tabs; a page's end is never under them.
+      {
+        const { w, d } = await journal(375, 760);
+        report(w.getComputedStyle(d.getElementById('rail')).display === 'none' && w.getComputedStyle(d.getElementById('tabbar')).display === 'flex',
+          'phone: tabs along the bottom instead of the rail');
+        const scroll = d.getElementById('page-scroll');
+        scroll.scrollTop = scroll.scrollHeight;
+        await settle();
+        const page = d.querySelector('#page-scroll .page');
+        const lastChild = page.lastElementChild.getBoundingClientRect();
+        const tabs = d.getElementById('tabbar').getBoundingClientRect();
+        report(lastChild.bottom <= tabs.top + 1, 'phone: the end of the page clears the tab bar', `content ends ${Math.round(lastChild.bottom)}, tabs start ${Math.round(tabs.top)}`);
+      }
+
+      // 5. Every page renders and keeps to the width, wide and on a phone.
+      for (const width of [1280, 375]) {
+        // #/week and #/month open this week and this month: the sheet (the sample is dated from today)
+        const pages = ['#/today', '#/week', '#/month', '#/sessions', '#/commits', '#/summaries', '#/insights', '#/search?q=retry', '#/settings', '#/expiring'];
+        const bad = [];
+        const { w, d } = await journal(width);
+        for (const hash of pages) {
+          w.location.hash = hash;
+          await until(() => d.querySelector('#page-scroll .page'));
+          await settle();
+          const empty = !d.querySelector('#page-scroll .page')?.children.length;
+          const o = overflowX(w, d);
+          if (empty || o > 1) bad.push(`${hash}${empty ? ' empty' : ''}${o > 1 ? ` +${o}px` : ''}`);
+        }
+        for (const group of ['Tree', 'Cards']) {
+          w.location.hash = '#/sessions';
+          await settle();
+          [...d.querySelectorAll('.seg-btn')].find((b) => b.textContent === group).click();
+          await settle();
+          if (group === 'Tree') {
+            // Folders open closed (their paths, ≈time, last active) under a section's label, with
+            // Still going on top; Expand all shows every session.
+            if (overflowX(w, d) > 1 || !d.querySelector('.trow') || !d.querySelector('.tree-label')) bad.push('sessions by Folder (closed)');
+            if (!d.querySelector('.going .scard')) bad.push('sessions: no Still going');
+            [...d.querySelectorAll('.tree-tools button')].find((b) => b.textContent === 'Expand all').click();
+            await settle();
+            if (overflowX(w, d) > 1 || !d.querySelector('.tree .srow') || !d.querySelector('.tree .fold')) bad.push('sessions by Folder (expanded)');
+            const rowBad = sessionRows(w, d);
+            if (rowBad.length) bad.push(...rowBad);
+            [...d.querySelectorAll('.tree-tools button')].find((b) => b.textContent === 'Collapse all').click();
+            await settle();
+          } else if (overflowX(w, d) > 1 || !d.querySelector('.tiles:not(.going) .scard') || !d.querySelector('.page-sessions h2 .day-link')
+            || d.querySelector('.page-sessions .srow:not(.going-arch-row .srow)')) bad.push(`sessions as ${group}`);
+        }
+        // Insights: who made your commits (the sample has yours, Claude's, Copilot's and Cursor's), month by month.
+        w.location.hash = '#/insights';
+        await settle();
+        if (!d.querySelector('.rep-commits .sharebar') || d.querySelectorAll('.rep-commits .rep-stack').length < 1 || overflowX(w, d) > 1) bad.push('insights: who made your commits');
+        report(!bad.length, `${width}px: every page renders and fits`, bad.join(', '));
+        if (width === 1280) localStorage.setItem('throwbacks-view', JSON.stringify({ v: 2, auto: false }));
+      }
+      restore();
+
+      // 6. Menus stay on screen: a plan's menu and the calendar.
+      for (const width of [1280, 375]) {
+        const { w, d } = await journal(width);
+        const off = [];
+        d.querySelector('.chip-more').click();
+        await settle();
+        let pop = d.querySelector('.popover')?.getBoundingClientRect();
+        if (!pop || pop.left < 0 || pop.right > w.innerWidth + 1 || pop.bottom > w.innerHeight + 1) off.push('plan menu');
+        d.body.click();
+        await settle();
+        const cal = d.querySelector('[aria-label="Pick a day"]');
+        if (cal && w.getComputedStyle(cal).display !== 'none') {
+          cal.click();
+          await settle();
+          pop = d.querySelector('.cal-pop')?.getBoundingClientRect();
+          if (!pop || pop.left < 0 || pop.right > w.innerWidth + 1 || pop.bottom > w.innerHeight + 1) off.push('calendar');
+        }
+        report(!off.length, `${width}px: menus open on screen`, off.join(', '));
+      }
+
+      // 7. The tool filter narrows the day and puts it back — on a recent
+      // day with a Copilot chat among others (the sample is dated from today).
+      {
+        const key = (t) => `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+        let d = null;
+        for (let back = 0; back < 14 && !d; back++) {
+          const day = new Date();
+          day.setDate(day.getDate() - back);
+          const got = await journal(1280, 800, `#/day/${key(day)}`);
+          const cards = got.d.querySelectorAll('.scard');
+          if (cards.length > 1 && got.d.querySelector('.scard .src-copilot, .scard .src-copilot-cli')) d = got.d;
+        }
+        d = d || (await journal(1280)).d;
+        const before = d.querySelectorAll('.scard').length;
+        const chip = [...d.querySelectorAll('.plan-chip')].find((b) => b.textContent.includes('Copilot'));
+        if (chip) {
+          chip.click();
+          await settle();
+          const narrowed = d.querySelectorAll('.scard').length;
+          [...d.querySelectorAll('.planbar > .chip')][0].click();
+          await settle();
+          report(narrowed > 0 && narrowed < before && d.querySelectorAll('.scard').length === before,
+            'the tool filter narrows a day, and All tools puts it back', `${before} → ${narrowed} → ${d.querySelectorAll('.scard').length}`);
+        } else {
+          report(false, 'the tool filter narrows a day', 'no Copilot chip in the sample');
+        }
+      }
+
+      // 8. A day's cards: each exactly fills its place in the grid, with its
+      // text and buttons inside — on the day of the sample's resumable chat,
+      // whose first message holds a long path. (A card with buttons once grew
+      // to that path's width, under the card beside it, buttons on its text.)
+      {
+        const key = (t) => `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+        let got = null;
+        for (let back = 0; back < 14 && !got; back++) {
+          const day = new Date();
+          day.setDate(day.getDate() - back);
+          const g = await journal(1280, 800, `#/day/${key(day)}`);
+          if (g.d.querySelector('.scard-wrap')) got = g;
+        }
+        if (!got) {
+          report(false, 'a day\'s cards fit their places', 'no card with resume buttons in the sample');
+        } else {
+          const { w, d } = got;
+          const root = d.documentElement;
+          const bad = [];
+          const meet = (a, b) => a.right > b.left + 1 && a.left < b.right - 1 && a.bottom > b.top + 1 && a.top < b.bottom - 1;
+          const check = (label) => {
+            for (const grid of d.querySelectorAll('.cards')) {
+              const boxes = [];
+              for (const item of grid.children) {
+                const card = item.matches('.scard') ? item : item.querySelector('.scard');
+                const cell = item.getBoundingClientRect();
+                const c = card.getBoundingClientRect();
+                const acts = item.querySelector('.scard-actions')?.getBoundingClientRect();
+                const icons = [...item.querySelectorAll('.scard-act svg')].map((el) => el.getBoundingClientRect());
+                const texts = [...card.querySelectorAll('.scard-app, .scard-when, .scard-title, .scard-ask, .scard-foot > span')];
+                const foot = [...card.querySelectorAll('.scard-foot > span')].map((el) => el.getBoundingClientRect());
+                const why = [];
+                if (Math.abs(c.left - cell.left) > 1 || Math.abs(c.right - cell.right) > 1) why.push(`a ${Math.round(c.width)}px card in a ${Math.round(cell.width)}px place`);
+                if (texts.some((el) => el.scrollWidth > el.clientWidth + 1)) why.push('text past the card');
+                if (acts && (acts.left < c.left - 1 || acts.right > c.right + 1 || acts.bottom > c.bottom + 1)) why.push('buttons outside the card');
+                // The icons clear all text; the bottom line's text clears the buttons themselves.
+                if (texts.some((el) => icons.some((i) => meet(el.getBoundingClientRect(), i))) || (acts && foot.some((f) => meet(f, acts)))) why.push('buttons on the text');
+                if (boxes.some((b) => meet(b, c))) why.push('over another card');
+                boxes.push(c);
+                if (why.length) bad.push(`${label}: ${why.join(', ')}`);
+              }
+            }
+          };
+          for (const text of TEXT) {
+            for (const font of FONTS) {
+              if (text === 'default') delete root.dataset.text; else root.dataset.text = text;
+              if (font) root.dataset.gfont = font; else delete root.dataset.gfont;
+              for (const width of WIDTHS) {
+                frame.width = width;
+                await settle();
+                check(`${width}px ${text} ${font || 'Onest'}`);
+              }
+            }
+          }
+          delete root.dataset.text;
+          delete root.dataset.gfont;
+          // Beside the conversation, where the page is narrower.
+          frame.width = 1600;
+          await settle();
+          d.querySelector('.scard-wrap .scard').click();
+          await settle();
+          for (const width of [1600, 1440, 1280, 1181]) {
+            frame.width = width;
+            await settle();
+            check(`${width}px, the conversation open`);
+          }
+          report(!bad.length, 'a day\'s cards: each fills its place, text and buttons inside (a long path in the first message)',
+            `${bad.length ? `${bad.length} problems — ` : ''}${bad.slice(0, 4).join('; ')}`);
+        }
+      }
+
+      // 9. A summary with a long recap: the title and its buttons stay put, and
+      // everything under them — the recap too — scrolls as one. (The recap once
+      // stayed still while only the list under it scrolled, in a thin strip.)
+      // A made-up summary, shown directly: nothing is read, sent or saved.
+      for (const width of [1280, 375]) {
+        const { w, d } = await journal(width);
+        const ui = await w.eval('import("/js/summarize-ui.js")');
+        const point = (what, i) => `${what} ${i + 1}: a made-up line about what was decided, what was left open and why, long enough to wrap in the dialog.`;
+        ui.openSummaryViewer({
+          rangeLabel: 'Layout check', at: Date.now(), provider: 'claudecode', status: 'done',
+          recap: Array.from({ length: 12 }, (_, i) => `- ${point('Recap point', i)}`).join('\n'),
+          perSession: [{ title: 'A made-up chat', when: 'today', bullets: Array.from({ length: 10 }, (_, i) => point('Point', i)) }],
+        });
+        await settle();
+        const panel = d.querySelector('.sum-panel');
+        const body = panel?.querySelector('.sum-body');
+        const recap = panel?.querySelector('.sum-recap');
+        const bad = [];
+        if (!body || !recap || !body.contains(recap)) bad.push('the recap isn\'t in the scrolling part');
+        else {
+          // The title is outside the one scrolling part, and the dialog itself never scrolls: so it stays put.
+          if (body.contains(panel.querySelector('.modal-head'))) bad.push('the title scrolls away');
+          // offset* measure the layout box: the dialog's entrance (frozen while this pane isn't on screen) doesn't count.
+          if (panel.offsetTop < 0 || panel.offsetTop + panel.offsetHeight > w.innerHeight + 1) bad.push('the dialog runs off the screen');
+          if (panel.scrollHeight > panel.clientHeight + 1) bad.push('the dialog itself scrolls');
+          if (body.scrollHeight <= body.clientHeight + 1) bad.push('nothing to scroll (the made-up recap is too short)');
+          if (body.clientHeight < panel.clientHeight * 0.6) bad.push(`the scrolling part is only ${body.clientHeight}px of ${panel.clientHeight}px`);
+          // Measured against the scrolling part, so the entrance's slide or scale doesn't count either.
+          const at = () => recap.getBoundingClientRect().top - body.getBoundingClientRect().top;
+          const before = at();
+          body.scrollTop = 200;
+          body.dispatchEvent(new Event('scroll'));  // a hidden pane may not send one by itself
+          await settle();
+          if (before - at() < 150) bad.push('the recap stayed still');
+          if (!panel.hasAttribute('data-scrolled')) bad.push('no line under the title once scrolled');
+        }
+        report(!bad.length, `${width}px: a long summary scrolls as one, the title stays put`, bad.join(', '));
+        d.querySelector('.sum-panel .modal-head .icon-btn')?.click();
+      }
+
+      // 10. The sheet, grouped: by Date — each day a band, its folders as
+      // sub-heads, the task the widest column — and by Folder (each folder
+      // once); every task row whole (no merged cells: they read as rows left
+      // open); wide and on a phone, nothing cut off or spilling sideways.
+      for (const width of [1280, 375]) {
+        const key = (t) => `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`;
+        let got = null;
+        for (let back = 0; back < 4 && !got; back++) {
+          const day = new Date();
+          day.setDate(day.getDate() - ((day.getDay() + 6) % 7) - 7 * back);
+          const g = await journal(width, 800, `#/week/${key(day)}`);
+          if ([...g.d.querySelectorAll('.sheet-fold .fold-name')].some((el) => el.textContent !== 'No folder')) got = g;
+        }
+        if (!got) {
+          report(false, `${width}px: the sheet groups by date and by folder`, 'no week with a folder in the sample');
+          continue;
+        }
+        const { w, d } = got;
+        const bad = [];
+        // (a long folder name ends in "…" on purpose, so names aren't counted)
+        const cut = (t) => [...t.querySelectorAll('td.c-task, td.c-app, td.c-dur, td.c-day')].filter((el) => el.scrollWidth > el.clientWidth + 1).length;
+        const open = (t, cols) => [...t.querySelectorAll('tbody tr')].filter((tr) => tr.querySelector('td.c-task') && (tr.cells.length !== cols || [...tr.cells].some((c) => c.rowSpan > 1))).length;
+        let t = d.querySelector('.sheet.is-days');
+        if (!t) bad.push('Day: no sheet');
+        else {
+          if (t.querySelectorAll('.sheet-dayrow').length !== 7) bad.push(`Day: ${t.querySelectorAll('.sheet-dayrow').length} day bands, not 7`);
+          const widths = [...t.querySelectorAll('thead th')].map((th) => th.offsetWidth);
+          if (Math.max(...widths) !== t.querySelector('thead th.c-task').offsetWidth) bad.push('Day: the task isn’t the widest column');
+          if (cut(t)) bad.push(`Day: ${cut(t)} cells cut off`);
+          if (open(t, 4)) bad.push(`Day: ${open(t, 4)} rows not whole`);
+          if (overflowX(w, d) > 1) bad.push('Day: the page scrolls sideways');
+          const wrap = d.querySelector('.sheet-wrap');
+          if (wrap.scrollWidth > wrap.clientWidth + 1) bad.push('Day: the sheet scrolls sideways');
+        }
+        d.querySelector('[data-focus="sheet-group-folder"]').click();
+        await settle();
+        t = d.querySelector('.sheet.is-folders');
+        if (!t) bad.push('Folder: no sheet');
+        else {
+          const names = [...t.querySelectorAll('.sheet-projrow .fold-name')].map((el) => el.textContent);
+          if (!names.length || new Set(names).size !== names.length) bad.push(`Folder: bands ${names.join(', ')}`);
+          if (!t.querySelector('.sheet-week-foot .is-total')) bad.push('Folder: no total');
+          if (cut(t)) bad.push(`Folder: ${cut(t)} cells cut off`);
+          if (open(t, 5)) bad.push(`Folder: ${open(t, 5)} rows not whole`);
+          if (overflowX(w, d) > 1) bad.push('Folder: the page scrolls sideways');
+        }
+        d.querySelector('[data-focus="sheet-group-day"]').click();
+        await settle();
+        if (!d.querySelector('.sheet.is-days')) bad.push('Day again: no sheet');
+        report(!bad.length, `${width}px: the sheet groups by date (bands, folders) and by folder, every row whole, nothing cut off`, bad.join(', '));
+      }
+
+      // 11. Still going: every chat a card, none behind "Show more" — four to a row on a wide
+      // page, one row to swipe on a phone with the next card peeking in — each card's text inside
+      // it and clear of its buttons, with its path. Pinning puts a chat first, outlined; archiving
+      // moves it to its fold, and Restore puts it back. (/?sample: marked in the frame's tab only.)
+      for (const width of [1280, 375]) {
+        const { w, d } = await journal(width, 800, '#/sessions');
+        const bad = [];
+        const seg = (label) => [...d.querySelectorAll('#topbar .seg-btn')].find((b) => b.textContent === label);
+        seg('Tree').click();  // whichever view this browser last saved
+        await settle();
+        const cards = () => [...d.querySelectorAll('.going .scard-wrap')];
+        const titleOf = (c) => c.querySelector('.scard-title').textContent;
+        /** A card's line (its days or messages, its ≈time) never under its resume buttons. */
+        const clearOfButtons = (c) => {
+          const acts = c.querySelector(':scope > .scard-actions');
+          const a = acts && acts.getBoundingClientRect();
+          return !a || ![...c.querySelectorAll('.scard-foot > *')].some((x) => { const r = x.getBoundingClientRect(); return r.right > a.left + 1 && r.bottom > a.top; });
+        };
+        const n = cards().length;
+        if (n < 5) bad.push(`${n} cards, not the sample's 5`);
+        if (d.querySelector('.going-more')) bad.push('a Show more button');
+        const top0 = n ? cards()[0].offsetTop : 0;
+        if (width === 1280 && cards().filter((c) => c.offsetTop === top0).length !== 4) bad.push(`${cards().filter((c) => c.offsetTop === top0).length} to a row, not 4`);
+        if (width === 375) {
+          const row = d.querySelector('.going .cards');
+          if (cards().some((c) => c.offsetTop !== top0) || row.scrollWidth <= row.clientWidth) bad.push('not one row to swipe');
+          if (n > 1 && cards()[1].getBoundingClientRect().left >= row.getBoundingClientRect().right) bad.push('the next card doesn’t peek in');
+        }
+        for (const c of cards()) {
+          const box = c.querySelector('.scard').getBoundingClientRect();
+          if (!c.querySelector('.scard-path')) bad.push(`${titleOf(c)}: no path`);
+          for (const el of c.querySelectorAll('.scard-top, .scard-title, .scard-path, .scard-foot')) {
+            const r = el.getBoundingClientRect();
+            if (r.right > box.right + 1 || r.bottom > box.bottom + 1) bad.push(`${titleOf(c)}: text past its card`);
+          }
+          if (!clearOfButtons(c)) bad.push(`${titleOf(c)}: its line under its buttons`);
+        }
+        if (n) {
+          const name = titleOf(cards()[n - 1]);
+          cards()[n - 1].querySelector('[data-focus^="pin:"]').click();
+          await settle();
+          if (titleOf(cards()[0]) !== name || !cards()[0].classList.contains('is-pinned')) bad.push('pinning doesn’t put it first');
+          cards()[0].querySelector('[data-focus^="archive:"]').click();
+          await settle();
+          const fold = d.querySelector('.going-arch .fold');
+          if (cards().some((c) => titleOf(c) === name) || !fold) bad.push('archiving doesn’t move it to its fold');
+          else {
+            if (fold.getAttribute('aria-expanded') !== 'true') fold.click();  // (it remembers being open)
+            await settle();
+            const restore = d.querySelector('.going-arch-row .restore-btn');
+            if (!restore || (width === 375 && w.getComputedStyle(restore.parentElement).opacity !== '1')) bad.push('no Restore');
+            else {
+              restore.click();
+              await settle();
+              if (!cards().some((c) => titleOf(c) === name) || d.querySelector('.going-arch')) bad.push('Restore doesn’t put it back');
+            }
+          }
+        }
+        if (overflowX(w, d) > 1) bad.push('the page scrolls sideways');
+        // "See all N as cards": every chat as a card — Still going's, then the bands' (each chat once,
+        // a band's quick chats folded) — each inside its place; then back to the Tree. A chat with
+        // resume buttons is archived first, so a band holds one (its line clear of them).
+        const all = d.querySelector('[data-focus="going-all"]');
+        const resumable = cards().find((c) => c.querySelector(':scope > .scard-actions'));
+        if (!all || !resumable) bad.push(all ? 'no card with resume buttons in the sample' : 'no “See all as cards”');
+        else {
+          const total = Number(all.textContent.match(/\d+/)[0]);
+          const moved = titleOf(resumable);
+          resumable.querySelector('[data-focus^="archive:"]').click();
+          await settle();
+          d.querySelector('[data-focus="going-all"]').focus();
+          d.querySelector('[data-focus="going-all"]').click();
+          await settle();
+          if (d.activeElement !== seg('Cards')) bad.push('cards: the keyboard isn’t on Cards');
+          const ids = [...d.querySelectorAll('.page-sessions .tiles .scard')].map((c) => c.dataset.focus);
+          const quick = [...d.querySelectorAll('.tiles:not(.going) > .fold[aria-expanded="false"]')].reduce((t, f) => t + Number(f.textContent.match(/\d+/)[0]), 0);
+          if (ids.length + quick !== total || new Set(ids).size !== ids.length) bad.push(`cards: ${ids.length} + ${quick} quick of ${total}, ${ids.length - new Set(ids).size} twice`);
+          if (!d.querySelector('.tiles:not(.going) .day-link')) bad.push('cards: no bands');
+          for (const c of d.querySelectorAll('.tiles .scard-wrap')) {
+            const box = c.getBoundingClientRect();
+            const place = c.parentElement.getBoundingClientRect();
+            if (!c.closest('.going') && (box.right > place.right + 1 || box.left < place.left - 1)) bad.push(`cards: ${titleOf(c)} past its band`);
+            // its app and day on one line (a long name like "Copilot in VS Code" ends in "…")
+            for (const el of c.querySelectorAll('.scard-app, .scard-when')) {
+              if (el.getBoundingClientRect().height > 2 * parseFloat(w.getComputedStyle(el).fontSize)) bad.push(`cards: ${titleOf(c)}’s ${el.className} on two lines`);
+            }
+          }
+          const band = [...d.querySelectorAll('.tiles:not(.going) .scard-wrap')].find((c) => titleOf(c) === moved);
+          if (!band || !band.querySelector(':scope > .scard-actions') || !clearOfButtons(band)) bad.push(`cards: “${moved}” not in its band with its buttons clear`);
+          // A band's quick chats, opened: cards in the band's grid (not a column).
+          const quickFold = d.querySelector('.tiles:not(.going) > .fold[aria-expanded="false"]');
+          if (quickFold && width === 1280) {
+            quickFold.click();
+            await settle();
+            const kids = [...d.querySelectorAll('.tiles .cards.fold-kids > .scard-wrap')];
+            if (kids.length > 1 && kids[1].offsetTop !== kids[0].offsetTop) bad.push('cards: a band’s quick chats in a column');
+            d.querySelector('.tiles:not(.going) > .fold[aria-expanded="true"]').click();
+            await settle();
+          }
+          if (overflowX(w, d) > 1) bad.push('cards: the page scrolls sideways');
+          const fold = d.querySelector('.going-arch .fold');  // put the archived chat back
+          if (fold && fold.getAttribute('aria-expanded') !== 'true') fold.click();
+          await settle();
+          [...d.querySelectorAll('.going-arch-row')].find((r) => r.textContent.includes(moved))?.querySelector('.restore-btn').click();
+          await settle();
+          seg('Tree').click();
+          await settle();
+          if (!d.querySelector('.tree') || !cards().some((c) => titleOf(c) === moved)) bad.push('Tree: no folders, or the archived chat not back');
+        }
+        // Filtering hides Still going — with no stray "null" in its place (append() writes a null as text).
+        const field = d.querySelector('input[aria-label="Filter sessions"]');
+        field.value = 'retry';
+        field.dispatchEvent(new w.Event('input', { bubbles: true }));
+        await settle();
+        const page = d.querySelector('.page-sessions');
+        if (d.querySelector('.going') || [...page.childNodes].some((x) => x.nodeType === 3 && x.textContent.trim() === 'null')) bad.push('filtering: Still going or a "null" shows');
+        field.value = '';
+        field.dispatchEvent(new w.Event('input', { bubbles: true }));
+        await settle();
+        report(!bad.length, `${width}px: Still going — every chat a card (four to a row wide, a row to swipe on a phone), pin, archive, restore; Cards — every chat once, by band`, bad.join(', '));
+      }
+
+      // 12. The Commits page: Made by in the plan bar's place; each commit in columns that line
+      // up down the page (wide) or its message on a line of its own (a phone), inside its row;
+      // Made by narrows it; a square of the heatmap and a day's commits line land on that day,
+      // marked and in view; Search finds commit messages; the phone's tab bar keeps five tabs.
+      for (const width of [1280, 375]) {
+        const { w, d } = await journal(width, 800, '#/commits');
+        await until(() => d.querySelector('.page-commits .crow'));
+        await settle();
+        const bad = [];
+        const notes = [];
+        if (!d.getElementById('madeby') || d.querySelector('#topbar .plan-chip')) bad.push('no Made by, or the plan bar shows');
+        if (topbarSpill(w, d) > 1) bad.push(`the top bar spills ${topbarSpill(w, d)}px`);
+        if (overflowX(w, d) > 1) bad.push('the page scrolls sideways');
+        const rows = [...d.querySelectorAll('.page-commits .crow.is-cols')];
+        const at = (sel, side) => [...new Set(rows.map((r) => r.querySelector(sel)).filter(Boolean).map((x) => Math.round(x.getBoundingClientRect()[side])))];
+        const wide = d.querySelector('.page-commits .commits').clientWidth > 34 * 16;
+        if (width === 1280 && !wide) bad.push('wide, but the rows are in their narrow layout');
+        if (wide) {
+          for (const [sel, side] of [['.crow-who', 'left'], ['.crow-repo', 'left'], ['.crow-when', 'right'], ['.crow-id', 'right']]) {
+            if (at(sel, side).length > 1) bad.push(`${sel} at ${at(sel, side).join(' / ')}`);
+          }
+        }
+        for (const r of rows) {
+          const box = r.getBoundingClientRect();
+          const msg = r.querySelector('.crow-msg').getBoundingClientRect();
+          const who = r.querySelector('.crow-who').getBoundingClientRect();
+          const id = r.querySelector('.crow-id').getBoundingClientRect();
+          if (id.right > box.right + 1 || msg.right > box.right + 1) bad.push(`${r.textContent.slice(0, 24)}: past its row`);
+          if (wide ? msg.right > who.left + 1 : msg.bottom > who.top + 1) bad.push(`${r.textContent.slice(0, 24)}: its message runs into who made it`);
+        }
+        // Made by: one tool
+        const before = rows.length;
+        d.querySelector('[data-focus="madeby-claude"]').click();
+        await settle();
+        const tags = [...d.querySelectorAll('.page-commits .crow .ctag')];
+        if (!tags.length || tags.length >= before || tags.some((t) => !/is-(claude|maybe)/.test(t.className))) bad.push(`Made by Claude: ${tags.length} of ${before}`);
+        if (d.activeElement !== d.querySelector('[data-focus="madeby-claude"]')) bad.push('Made by: the keyboard left the chip');
+        d.querySelector('[data-focus="madeby-all"]').click();
+        await settle();
+        // A square: the oldest day with commits
+        const inView = (el) => {
+          const r = el.getBoundingClientRect();
+          const box = d.getElementById('page-scroll').getBoundingClientRect();
+          return r.top >= box.top - 1 && r.top < box.bottom - 40;
+        };
+        const squares = [...d.querySelectorAll('.heatmap-cell.clickable')];
+        squares[0].dispatchEvent(new w.MouseEvent('click', { bubbles: true }));
+        const flashed = await until(() => d.querySelector('.cday.is-flash'));
+        // The square's scroll is smooth: it moves only while the page gets animation frames,
+        // which a hidden browser pane doesn't give it — then only the day it marks is checked.
+        const frames = await Promise.race([new Promise((r) => w.requestAnimationFrame(() => r(true))), sleep(600).then(() => false)]);
+        if (flashed && frames) await until(() => inView(flashed), 4000);
+        if (!flashed || flashed.id !== `d-${squares[0].dataset.key}` || (frames && !inView(flashed))) bad.push(`a square: ${flashed ? `${flashed.id}${inView(flashed) ? '' : ' not in view'}` : 'no day marked'}`);
+        if (!frames) notes.push('the square’s smooth scroll not watched (no animation frames: is the pane hidden?)');
+        // A day's commits line
+        const newest = d.querySelector('.cday').id.slice(2);
+        w.location.hash = `#/day/${newest}`;
+        await until(() => d.querySelector('.page-day .day-commits a'));
+        d.querySelector('.page-day .day-commits a').click();
+        const landed = await until(() => d.querySelector('.cday.is-flash'));
+        if (w.location.hash !== `#/commits/${newest}` || !landed || landed.id !== `d-${newest}` || !inView(landed)) bad.push(`a day's line: ${w.location.hash} ${landed ? landed.id : 'no day marked'}`);
+        // Search: commit messages too
+        w.location.hash = '#/search?q=retry';
+        await until(() => d.querySelector('.page-search'));
+        await settle();
+        if (!d.querySelector('.sres-commits .crow')) bad.push('Search: no commits');
+        if (width === 375) {
+          const tabs = [...d.querySelectorAll('#tabbar .tab')].map((t) => t.textContent);
+          if (tabs.length !== 5 || tabs.some((t) => t.startsWith('Commits'))) bad.push(`phone tabs: ${tabs.join(', ')}`);
+        }
+        report(!bad.length, `${width}px: Commits — Made by, columns that line up (a line each on a phone), a square and a day's line land on that day, Search finds commits`, [...bad, ...notes].join(', '));
+      }
+
+      // 13. Settings: beside its cards on a wide page, an overview — each card's status, a click
+      // marking it and bringing the card into view, the last one marked at the end; on a phone just
+      // the cards. A fold you opened stays open when the page redraws.
+      for (const width of [1280, 375]) {
+        const { w, d } = await journal(width, 800, '#/settings');
+        await until(() => d.querySelector('.page-settings .set-card'));
+        await settle();
+        const bad = [];
+        const notes = [];
+        const nav = d.querySelector('.set-overview');
+        const shown = nav && w.getComputedStyle(nav).display !== 'none';
+        if (overflowX(w, d) > 1) bad.push('the page scrolls sideways');
+        if (topbarSpill(w, d) > 1) bad.push(`the top bar spills ${topbarSpill(w, d)}px`);
+        if (width === 1280) {
+          const entries = shown ? [...nav.querySelectorAll('.set-ov')] : [];
+          if (entries.length !== 5) bad.push(`overview: ${entries.length} entries`);
+          for (const e of entries) if (!d.getElementById(`set-${e.dataset.sec}`)) bad.push(`overview: no card for ${e.dataset.sec}`);
+          const cards = d.querySelector('.set-cards').getBoundingClientRect();
+          if (shown && nav.getBoundingClientRect().right > cards.left + 1) bad.push('overview: over the cards');
+          const scroll = d.getElementById('page-scroll');
+          const frames = await Promise.race([new Promise((r) => w.requestAnimationFrame(() => r(true))), sleep(600).then(() => false)]);
+          // The click's glide is over once the page stops moving (or never moves, with no frames).
+          const settled = async () => {
+            let last = -1;
+            await until(() => { const now = scroll.scrollTop; const still = now === last; last = now; return still; }, 4000);
+          };
+          // A card in the middle comes into view, marked; one near the end, which can't reach the top, stays marked too.
+          for (const sec of ['usage', 'appearance']) {
+            const entry = entries.find((e) => e.dataset.sec === sec);
+            if (!entry) continue;
+            entry.click();
+            await sleep(120);
+            await settled();
+            const card = d.getElementById(`set-${sec}`);
+            const box = scroll.getBoundingClientRect();
+            const r = card.getBoundingClientRect();
+            const inView = r.top >= box.top - 1 && r.top < box.bottom - 40;
+            const marked = d.querySelector('.set-ov.is-on')?.dataset.sec;
+            if (marked !== sec || (frames && !inView)) bad.push(`overview: ${sec} ${marked !== sec ? `not marked (${marked})` : 'not in view'}`);
+          }
+          if (!frames) notes.push('the smooth scroll not watched (no animation frames: is the pane hidden?)');
+          scroll.dispatchEvent(new w.WheelEvent('wheel', { deltaY: 10 }));  // you scrolling: the mark follows again
+          scroll.scrollTop = scroll.scrollHeight;
+          scroll.dispatchEvent(new w.Event('scroll'));
+          await settle();
+          if (d.querySelector('.set-ov.is-on')?.dataset.sec !== 'privacy') bad.push(`overview at the end: ${d.querySelector('.set-ov.is-on')?.dataset.sec}`);
+          scroll.scrollTop = 0;
+        } else if (shown) bad.push('phone: the overview shows');
+        // A fold stays open across a redraw (the end-of-day switch redraws the page; then it's put back),
+        // and the keyboard stays on the switch.
+        const fold = () => d.querySelector('#set-summaries .set-fold');
+        fold().querySelector('summary').click();
+        await settle();  // its toggle event has run
+        const tick = () => d.querySelector('#set-summaries .set-check input[type=checkbox]');
+        for (let i = 0; i < 2; i++) {
+          const before = fold();
+          tick().focus();
+          tick().click();
+          await settle();
+          if (fold() === before) bad.push('test: the page didn’t redraw');
+          else if (!fold().open) bad.push(`a fold closed when the page redrew (${i + 1})`);
+          if (d.activeElement !== tick()) bad.push(`the keyboard left the switch after a redraw (${i + 1})`);
+        }
+        report(!bad.length, `${width}px: Settings — an overview beside the cards (a click marks and shows a card; the last at the end), none on a phone; folds stay open across a redraw`, [...bad, ...notes].join(', '));
+      }
+
+      // 14. Summaries: the sample's made-up summaries (never yours) as rows under a band, its filter in the
+      // plan bar's place; a row opens beside the page (a phone: full screen) with its lines and buttons;
+      // Today's summary card links here, and the Month page has its recap card.
+      for (const width of [1280, 375]) {
+        const { w, d } = await journal(width, 800, '#/summaries');
+        await until(() => d.querySelector('.page-sums .srow2'));
+        await settle();
+        const bad = [];
+        const rows = [...d.querySelectorAll('.page-sums .srow2')];
+        if (rows.length < 3) bad.push(`${rows.length} rows`);
+        if (d.querySelector('#topbar .plan-chip') || d.querySelectorAll('#topbar .planbar .chip').length !== 4) bad.push('no filter in the plan bar\'s place');
+        if (overflowX(w, d) > 1) bad.push('the page scrolls sideways');
+        if (topbarSpill(w, d) > 1) bad.push(`the top bar spills ${topbarSpill(w, d)}px`);
+        for (const r of rows) {
+          const box = r.getBoundingClientRect();
+          if ([...r.children].some((c) => c.getBoundingClientRect().right > box.right + 1)) bad.push(`${r.textContent.slice(0, 24)}: past its row`);
+        }
+        const day = rows.find((r) => r.querySelector('.srow2-kind').textContent === 'Day');
+        day.click();
+        await settle();
+        const pane = d.getElementById('reader');
+        if (pane.hidden || !pane.querySelector('.reader-title') || !pane.querySelector('.slines li') || !pane.querySelector('.reader-actions button')) bad.push('a day\'s summary didn\'t open beside the page');
+        if (width === 375 && pane.offsetWidth < w.innerWidth - 2) bad.push('phone: the summary isn\'t full screen');
+        // Every button whole: on a narrow pane an icon, its name hidden — never two names drawn over each other;
+        // nothing in the pane scrolls sideways (the sample has a line with a long path in it).
+        const wholePane = (what) => {
+          pane.getAnimations().forEach((a) => a.finish());  // its slide-in, frozen at the first frame in a hidden pane
+          for (const b of pane.querySelectorAll('.reader-actions button')) {
+            if (b.scrollWidth > b.offsetWidth + 1) bad.push(`${what}: "${b.getAttribute('aria-label') || b.textContent}" doesn't fit its button`);
+            if (!b.getAttribute('aria-label')) bad.push(`${what}: a button with no name: ${b.textContent}`);
+          }
+          if (overflowX(w, d) > 1) bad.push(`${what}: it scrolls sideways`);
+        };
+        wholePane('a day');
+        if (width === 375) {
+          // A dialog opened over the full-screen summary shows on top of it (a made-up app's, opening nothing).
+          const sp = await w.eval('import("/js/summariespage.js")');
+          sp.openRecapDialog({ state: { job: null, reader: null, summaries: { days: {}, weeks: {}, months: {}, periods: {} } }, allRows: new Map(), recapPlan: () => ({ days: 0, calls: 1, from: 0, quiet: 0 }) });
+          // (Its backdrop, which covers the screen: the dialog itself slides in, frozen at its first frame in a hidden pane.)
+          const scrim = d.querySelector('.recap-modal').closest('.modal-overlay');
+          if (!scrim.contains(d.elementFromPoint(w.innerWidth / 2, w.innerHeight / 2))) bad.push('phone: a dialog opens behind the summary');
+          d.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          await settle();
+          // Open the day closes the full-screen summary, so the day shows.
+          const key = day.dataset.focus.replace('sum-day:', '');
+          pane.querySelector('.reader-actions button[aria-label="Open the day"]').click();
+          const opened = await until(() => d.querySelector('.page-day'));
+          await settle();
+          if (!opened || w.location.hash !== `#/day/${key}`) bad.push(`phone: Open the day didn't open ${key} (${w.location.hash})`);
+          if (!pane.hidden) bad.push('phone: Open the day left the summary over the day');
+          w.location.hash = '#/summaries';
+          await until(() => d.querySelector('.page-sums .srow2'));
+          await settle();
+        } else {
+          d.querySelector('#reader .reader-close').click();
+          await settle();
+          if (!pane.hidden) bad.push('closing the summary left it open');
+        }
+        // The recaps: one up to date (its text, the days it was written from, Write again), one out of date.
+        const recaps = [...d.querySelectorAll('.page-sums .srow2')].filter((r) => ['Period', 'Week'].includes(r.querySelector('.srow2-kind').textContent));
+        if (recaps.length !== 2) bad.push(`${recaps.length} recap rows (the sample has two)`);
+        const period = recaps.find((r) => r.querySelector('.srow2-kind').textContent === 'Period');
+        if (period) {
+          period.click();
+          await settle();
+          if (!pane.querySelector('.sread-recap') || pane.querySelectorAll('.sread-days button').length !== 3) bad.push('the period\'s recap: no text, or not its 3 days');
+          // In parts: a line, then each project's name and points, "Still open" last.
+          const groups = [...pane.querySelectorAll('.sread-recap .recap-group')].map((g) => g.textContent);
+          if (!pane.querySelector('.sread-recap .recap-head') || groups.length !== 4 || groups[3] !== 'Still open'
+            || pane.querySelectorAll('.sread-recap .recap-points li').length !== 7) bad.push(`the period's recap isn't in its parts (${groups.join(' / ')})`);
+          wholePane('a period');
+          if (pane.querySelector('.summary-hint')) bad.push('an up-to-date recap says a day changed');
+          // Write again needs a summarizer (as Recap a period… does): there's none on a plain static server.
+          const can = !d.querySelector('#topbar [data-focus="recap-period"]')?.disabled;
+          if (can !== !!pane.querySelector('.reader-actions button[aria-label="Write again"]')) bad.push(can ? 'a recap with no Write again' : 'Write again with no summarizer');
+        }
+        const week = recaps.find((r) => r.querySelector('.srow2-kind').textContent === 'Week');
+        if (week) {
+          if (!/a day changed since/.test(week.textContent)) bad.push('the out-of-date week isn\'t marked');
+          week.click();
+          await settle();
+          if (!pane.querySelector('.summary-hint')) bad.push('the out-of-date week\'s recap doesn\'t say so');
+          wholePane('a week');
+        }
+        if (width === 375) pane.querySelector('.reader-close').click();
+        else d.querySelector('#reader .reader-close').click();
+        await settle();
+        // The filter keeps the keyboard on the chip you pressed.
+        const chip = d.querySelector('#topbar [data-focus="sum-kind-recap"]');
+        chip.focus();
+        chip.click();
+        await settle();
+        if (d.activeElement?.dataset.focus !== 'sum-kind-recap') bad.push('the filter dropped the keyboard');
+        if (d.querySelectorAll('.page-sums .srow2').length !== 2) bad.push('Recaps doesn\'t show just the recaps');
+        d.querySelector('#topbar [data-focus="sum-kind-all"]').click();
+        await settle();
+        if (width === 375) {
+          const tabs = [...d.querySelectorAll('#tabbar .tab')].map((t) => t.textContent);
+          if (tabs.some((t) => t.startsWith('Summaries'))) bad.push('phone tabs: Summaries in the bar');
+        }
+        // Recap a period: built once — typing a date leaves the field where it is, with the keyboard in it.
+        // On a made-up app, shown directly (no summarizer needed): nothing is read, sent or saved.
+        {
+          const sp = await w.eval('import("/js/summariespage.js")');
+          const fake = {
+            state: { job: null, reader: null, summaries: { days: {}, weeks: {}, months: {}, periods: {} } },
+            allRows: new Map(), recapPlan: () => ({ days: 0, calls: 1, from: 1, quiet: 0 }), recap: async () => false, openSummary: () => {},
+          };
+          sp.openRecapDialog(fake);
+          const dlg = d.querySelector('.recap-modal');
+          const custom = dlg && [...dlg.querySelectorAll('.seg-btn')].find((b) => b.textContent === 'Custom dates');
+          if (!custom) bad.push('no recap dialog, or no Custom dates');
+          else {
+            custom.focus();
+            custom.click();
+            if (d.activeElement !== custom) bad.push('a choice dropped the keyboard');
+            const field = dlg.querySelector('.recap-dates input');
+            field.focus();
+            field.value = `${field.max.slice(0, 8)}01`;
+            field.dispatchEvent(new Event('change', { bubbles: true }));
+            if (!field.isConnected || d.activeElement !== field) bad.push('a date change rebuilt the dialog');
+            if (dlg.querySelector('.btn-brand').disabled) bad.push('a good period can\'t be started');
+            field.value = '2999-01-01';
+            field.dispatchEvent(new Event('change', { bubbles: true }));
+            if (!dlg.querySelector('.btn-brand').disabled) bad.push('a start after the end could be started');
+            if (!/start and an end/.test(dlg.querySelector('.recap-plan').textContent)) bad.push('the plan didn\'t follow the dates');
+          }
+          d.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          await settle();
+          if (d.querySelector('.recap-modal')) bad.push('Esc left the recap dialog open');
+        }
+        w.location.hash = '#/today';
+        await until(() => d.querySelector('.page-day'));
+        await settle();
+        if (!d.querySelector('.summary-card a[href="#/summaries"]')) bad.push('Today: no All summaries link');
+        w.location.hash = '#/month';
+        await until(() => d.querySelector('.page-month'));
+        await settle();
+        if (!d.querySelector('[aria-label="Month recap"]')) bad.push('Month: no recap card');
+        if (overflowX(w, d) > 1) bad.push('Month: the page scrolls sideways');
+        // The sample's week recap (its Monday is 5 days back's): plain content, edited as text with Edit.
+        const d5 = new Date();
+        d5.setHours(12, 0, 0, 0);
+        d5.setDate(d5.getDate() - 5);
+        d5.setDate(d5.getDate() - ((d5.getDay() + 6) % 7));
+        w.location.hash = `#/week/${d5.getFullYear()}-${String(d5.getMonth() + 1).padStart(2, '0')}-${String(d5.getDate()).padStart(2, '0')}`;
+        await until(() => d.querySelector('[aria-label="Week recap"] .week-recap'));
+        await settle();
+        const view = d.querySelector('[aria-label="Week recap"] .week-recap');
+        if (view.getAttribute('role') || view.getAttribute('aria-label')) bad.push('Week: the recap sits behind a role or label (screen readers wouldn\'t read it)');
+        const edit = d.querySelector('[data-focus="recap-edit-week"]');
+        if (!edit) bad.push('Week: no Edit for its recap');
+        else {
+          edit.click();
+          await settle();
+          const field = d.querySelector('[aria-label="Week recap"] .recap-field');
+          if (!field || d.activeElement !== field) bad.push('Week: Edit didn\'t open the recap\'s text with the keyboard in it');
+          else {
+            field.textContent = `${field.textContent}\n\n## etl\n- A point`;
+            field.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true }));
+            await settle();
+            await settle();
+            if (d.querySelector('[aria-label="Week recap"] .recap-field')) bad.push('Week: Ctrl+Enter left the recap\'s editor open');
+            if (!d.querySelector('[aria-label="Week recap"] .recap-group')) bad.push('Week: the edited recap isn\'t drawn in its parts');
+            if (d.activeElement !== d.querySelector('[data-focus="recap-edit-week"]')) bad.push('Week: after saving, the keyboard isn\'t back on Edit');
+          }
+        }
+        report(!bad.length, `${width}px: Summaries — rows under bands, the filter in the plan bar's place (keeping the keyboard), one opens beside the page (full screen on a phone, every button whole), recaps up to date and not, a recap in its parts (a line, each project's points, still open), the recap dialog built once; Today links here, Month has its recap card, a week's recap edited as text (Edit, Ctrl+Enter, the keyboard back on Edit)`, bad.join(', '));
+      }
+    } catch (e) {
+      report(false, 'the checks ran to the end', String(e && e.stack || e));
+    } finally {
+      restore();
+    }
+    const failed = results.filter((r) => !r.passed).length;
+    summary.textContent = failed ? `${failed} of ${results.length} checks FAILED` : `All ${results.length} checks passed`;
+    summary.className = failed ? 'fail' : 'pass';
+    window.layoutDone = true;
+  </script>
+</body>
+</html>
